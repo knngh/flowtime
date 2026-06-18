@@ -3,6 +3,7 @@ use tauri_plugin_sql::{Builder, Migration, MigrationKind};
 
 mod api;
 mod auto_reply;
+mod data_io;
 mod focus;
 mod integrations;
 mod learning;
@@ -17,8 +18,19 @@ fn greet(name: &str) -> String {
 
 /// Validate critical environment variables at startup and log warnings.
 fn validate_environment() {
+    let ollama_base = std::env::var("OLLAMA_API_BASE")
+        .or_else(|_| std::env::var("OLLAMA_HOST"))
+        .unwrap_or_default();
+
+    if !ollama_base.is_empty() {
+        log::info!("✅ 本地 LLM (Ollama) 已配置: {}", ollama_base);
+        let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5:7b".to_string());
+        log::info!("   Ollama 模型: {}", model);
+    }
+
     let checks = [
-        ("OPENAI_API_KEY", "AI 任务解析和排序功能需要"),
+        ("OPENAI_API_KEY", "云端 AI 任务解析和排序功能需要"),
+        ("OLLAMA_API_BASE", "本地 LLM 端点（替代 OpenAI）"),
         ("OPENAI_API_BASE", "自定义 API 端点（可选，默认 OpenAI）"),
         ("OPENAI_MODEL", "AI 模型选择（可选，默认 gpt-4o-mini）"),
         ("GITHUB_TOKEN", "GitHub Issues 集成需要"),
@@ -33,13 +45,15 @@ fn validate_environment() {
     for (var, desc) in &checks {
         match std::env::var(var) {
             Ok(val) if !val.is_empty() => {
-                log::info!("✅ 环境变量 {} 已设置（{}）", var, desc);
+                if *var != "OLLAMA_API_BASE" || ollama_base.is_empty() {
+                    log::info!("✅ 环境变量 {} 已设置（{}）", var, desc);
+                }
             }
             _ => {
-                if *var == "OPENAI_API_KEY" {
-                    log::warn!("⚠️  关键环境变量 {} 未设置 —— {}", var, desc);
+                if *var == "OPENAI_API_KEY" && ollama_base.is_empty() {
+                    log::warn!("⚠️  关键环境变量 OPENAI_API_KEY 未设置 —— {}", desc);
                     missing_critical = true;
-                } else {
+                } else if *var != "OLLAMA_API_BASE" {
                     optional_missing.push((var, desc));
                 }
             }
@@ -48,8 +62,10 @@ fn validate_environment() {
 
     if missing_critical {
         log::warn!(
-            "⚠️  缺少 OPENAI_API_KEY，AI 功能将使用启发式回退算法"
+            "⚠️  缺少 OPENAI_API_KEY 且未配置 Ollama，AI 功能将使用启发式回退算法"
         );
+    } else if !ollama_base.is_empty() {
+        log::info!("✅ 使用本地 Ollama 作为 AI 后端，无需 OpenAI API Key");
     }
 
     if !optional_missing.is_empty() {
@@ -155,6 +171,16 @@ pub fn run() {
             );
         ",
         },
+        Migration {
+            version: 5,
+            description: "add status and interruption count to focus_sessions",
+            kind: MigrationKind::Up,
+            sql: "
+            ALTER TABLE focus_sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'active';
+            ALTER TABLE focus_sessions ADD COLUMN interruption_count INTEGER NOT NULL DEFAULT 0;
+            UPDATE focus_sessions SET status = 'completed' WHERE end_time IS NOT NULL;
+        ",
+        },
     ];
 
     let sql_plugin = Builder::default()
@@ -163,6 +189,21 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_shortcuts([
+                    tauri_plugin_global_shortcut::Shortcut::new(
+                        Some(tauri_plugin_global_shortcut::Modifiers::SUPER | tauri_plugin_global_shortcut::Modifiers::SHIFT),
+                        tauri_plugin_global_shortcut::Code::KeyF,
+                    ),
+                    tauri_plugin_global_shortcut::Shortcut::new(
+                        Some(tauri_plugin_global_shortcut::Modifiers::SUPER | tauri_plugin_global_shortcut::Modifiers::SHIFT),
+                        tauri_plugin_global_shortcut::Code::KeyO,
+                    ),
+                ])
+                .build(),
+        )
         .plugin(sql_plugin)
         .setup(|app| {
             // Initialize logger
@@ -182,8 +223,11 @@ pub fn run() {
             greet,
             // M3: Focus mode
             focus::start_focus_session,
+            focus::pause_focus_session,
+            focus::resume_focus_session,
             focus::end_focus_session,
             focus::get_active_focus_session,
+            focus::get_focus_insight,
             // M2: LLM scheduling
             llm::parse_natural_language,
             llm::suggest_schedule,
@@ -211,6 +255,9 @@ pub fn run() {
             learning::calibrate_estimate,
             learning::get_peak_hours,
             learning::get_calibration_ratio,
+            // Data import/export
+            data_io::export_all_data,
+            data_io::import_all_data,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

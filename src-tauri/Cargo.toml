@@ -32,4 +32,6 @@ axum = "0.7"
 dirs-next = "2"
 log = "0.4"
 env_logger = "0.10"
+tauri-plugin-notification = "2"
+tauri-plugin-global-shortcut = "2"
 

@@ -352,3 +352,53 @@ pub async fn get_calibration_ratio(
 
     Ok(value.and_then(|s| s.parse::<f64>().ok()))
 }
+
+// ── Unit Tests ──
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_peak_hours_empty() {
+        let result = find_peak_hours(&[]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_peak_hours_single_block() {
+        let hourly = vec![
+            HourlyFocus { hour: 9, total_seconds: 3600 },
+            HourlyFocus { hour: 10, total_seconds: 7200 },
+            HourlyFocus { hour: 11, total_seconds: 5400 },
+            HourlyFocus { hour: 14, total_seconds: 1800 },
+        ];
+        let peak = find_peak_hours(&hourly).unwrap();
+        assert_eq!(peak.start_hour, 9);
+        // 9-11 is 3 hours, sum = 3600+7200+5400 = 16200
+        assert_eq!(peak.end_hour, 11);
+    }
+
+    #[test]
+    fn test_find_peak_hours_all_zero() {
+        let mut hourly: Vec<HourlyFocus> = Vec::new();
+        for h in 0..24 {
+            hourly.push(HourlyFocus { hour: h, total_seconds: 0 });
+        }
+        let result = find_peak_hours(&hourly);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_peak_hours_wraps_midnight() {
+        let hourly = vec![
+            HourlyFocus { hour: 23, total_seconds: 10000 },
+            HourlyFocus { hour: 0, total_seconds: 8000 },
+            HourlyFocus { hour: 1, total_seconds: 6000 },
+            HourlyFocus { hour: 12, total_seconds: 1000 },
+        ];
+        let peak = find_peak_hours(&hourly).unwrap();
+        // Best window should be 23-1 (wrapped) sum = 10000+8000+6000 = 24000
+        assert_eq!(peak.start_hour, 23);
+    }
+}

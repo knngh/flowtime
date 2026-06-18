@@ -21,6 +21,19 @@
       "csp": null
     }
   },
+  "plugins": {
+    "notification": {
+      "permission": {
+        "default": "granted"
+      }
+    },
+    "global-shortcut": {
+      "shortcuts": [
+        "CmdOrCtrl+Shift+F",
+        "CmdOrCtrl+Shift+O"
+      ]
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",

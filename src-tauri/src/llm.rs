@@ -41,6 +41,19 @@ struct ChatResponse {
 }
 
 fn get_llm_config() -> (String, String, String) {
+    // Check for Ollama first (local LLM takes priority if configured)
+    let ollama_base = std::env::var("OLLAMA_API_BASE")
+        .or_else(|_| std::env::var("OLLAMA_HOST"))
+        .unwrap_or_default();
+
+    if !ollama_base.is_empty() {
+        let api_base = ollama_base.trim_end_matches('/').to_string();
+        let model = std::env::var("OLLAMA_MODEL")
+            .unwrap_or_else(|_| "qwen2.5:7b".to_string());
+        let api_key = "ollama".to_string();
+        return (api_base, api_key, model);
+    }
+
     let api_base =
         std::env::var("OPENAI_API_BASE").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
     let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
@@ -51,8 +64,14 @@ fn get_llm_config() -> (String, String, String) {
 
 async fn chat_completion(system_prompt: &str, user_message: &str) -> Result<String, String> {
     let (api_base, api_key, model) = get_llm_config();
+    let is_ollama = api_key == "ollama";
 
-    if api_key.is_empty() {
+    // Ollama works without OpenAI API key; OpenAI requires key
+    if api_key.is_empty() || (api_key != "ollama" && api_key.is_empty()) {
+        return Err("NO_API_KEY".to_string());
+    }
+
+    if !is_ollama && api_key.is_empty() {
         return Err("NO_API_KEY".to_string());
     }
 
@@ -393,5 +412,114 @@ fn priority_value(p: &str) -> u8 {
         "B" => 1,
         "C" => 2,
         _ => 1,
+    }
+}
+
+// ── Unit Tests ──
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_json_code_fence() {
+        let input = "```json\n{\"title\": \"test\"}\n```";
+        assert_eq!(extract_json(input), "{\"title\": \"test\"}");
+    }
+
+    #[test]
+    fn test_extract_json_plain_object() {
+        let input = "Here is {\"priority\": \"A\", \"title\": \"do thing\"} end";
+        assert_eq!(extract_json(input), "{\"priority\": \"A\", \"title\": \"do thing\"}");
+    }
+
+    #[test]
+    fn test_extract_json_array() {
+        let input = "[\"a\", \"b\", \"c\"]";
+        assert_eq!(extract_json(input), "[\"a\", \"b\", \"c\"]");
+    }
+
+    #[test]
+    fn test_extract_json_nested() {
+        let input = r#"{"items": [{"nested": true}]}"#;
+        assert_eq!(extract_json(input), r#"{"items": [{"nested": true}]}"#);
+    }
+
+    #[test]
+    fn test_priority_value() {
+        assert_eq!(priority_value("A"), 0);
+        assert_eq!(priority_value("B"), 1);
+        assert_eq!(priority_value("C"), 2);
+        assert_eq!(priority_value("X"), 1);
+        assert_eq!(priority_value(""), 1);
+    }
+
+    #[test]
+    fn test_fallback_parse_chinese_urgent() {
+        let result = fallback_parse("紧急修复登录bug").unwrap();
+        assert_eq!(result.priority, "A");
+        assert_eq!(result.duration_min, 30); // default
+    }
+
+    #[test]
+    fn test_fallback_parse_chinese_hours() {
+        let result = fallback_parse("完成报告 2小时").unwrap();
+        assert_eq!(result.duration_min, 120);
+    }
+
+    #[test]
+    fn test_fallback_parse_chinese_minutes() {
+        let result = fallback_parse("休息 15分钟").unwrap();
+        assert_eq!(result.duration_min, 15);
+    }
+
+    #[test]
+    fn test_fallback_parse_english_hours() {
+        let result = fallback_parse("Design review 3h").unwrap();
+        assert_eq!(result.duration_min, 180);
+    }
+
+    #[test]
+    fn test_fallback_parse_low_priority() {
+        let result = fallback_parse("不急的task").unwrap();
+        assert_eq!(result.priority, "C");
+    }
+
+    #[test]
+    fn test_fallback_schedule_sorts_by_priority() {
+        let tasks = vec![
+            TaskForSchedule {
+                id: "1".into(), title: "C task".into(), priority: "C".into(),
+                estimated_duration_min: 30, status: "todo".into(),
+            },
+            TaskForSchedule {
+                id: "2".into(), title: "A task".into(), priority: "A".into(),
+                estimated_duration_min: 60, status: "todo".into(),
+            },
+            TaskForSchedule {
+                id: "3".into(), title: "B task".into(), priority: "B".into(),
+                estimated_duration_min: 15, status: "todo".into(),
+            },
+        ];
+        let ids = fallback_schedule(&tasks);
+        assert_eq!(ids[0], "2"); // A first
+        assert_eq!(ids[1], "3"); // B second (shorter than 60)
+        assert_eq!(ids[2], "1"); // C last
+    }
+
+    #[test]
+    fn test_fallback_schedule_in_progress_first() {
+        let tasks = vec![
+            TaskForSchedule {
+                id: "1".into(), title: "B todo".into(), priority: "B".into(),
+                estimated_duration_min: 30, status: "todo".into(),
+            },
+            TaskForSchedule {
+                id: "2".into(), title: "B in_progress".into(), priority: "B".into(),
+                estimated_duration_min: 60, status: "in_progress".into(),
+            },
+        ];
+        let ids = fallback_schedule(&tasks);
+        assert_eq!(ids[0], "2"); // in_progress before todo
     }
 }

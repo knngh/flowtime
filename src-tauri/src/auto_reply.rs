@@ -7,11 +7,22 @@ use tauri::State;
 // ── LLM helper ──
 
 async fn chat_completion(system_prompt: &str, user_message: &str) -> Result<String, String> {
-    let api_base = std::env::var("OPENAI_API_BASE")
-        .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-    let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-    let model = std::env::var("OPENAI_MODEL")
-        .unwrap_or_else(|_| "gpt-4o-mini".to_string());
+    // Check for Ollama first
+    let ollama_base = std::env::var("OLLAMA_API_BASE")
+        .or_else(|_| std::env::var("OLLAMA_HOST"))
+        .unwrap_or_default();
+
+    let (api_base, api_key, model) = if !ollama_base.is_empty() {
+        let m = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5:7b".to_string());
+        (ollama_base.trim_end_matches('/').to_string(), "ollama".to_string(), m)
+    } else {
+        let base = std::env::var("OPENAI_API_BASE")
+            .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+        let key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+        let m = std::env::var("OPENAI_MODEL")
+            .unwrap_or_else(|_| "gpt-4o-mini".to_string());
+        (base, key, m)
+    };
 
     if api_key.is_empty() {
         return Err("NO_API_KEY".to_string());

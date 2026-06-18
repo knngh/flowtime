@@ -27,7 +27,7 @@ Flowtime intelligently manages your tasks, tracks your focus sessions, monitors 
 │ auto_    │ integra- │ learning │ review.rs            │
 │ reply.rs │ tions.rs │ .rs      │                     │
 ├──────────┴──────────┴──────────┴─────────────────────┤
-│              SQLite (4 migrations)                     │
+│              SQLite (5 migrations)                     │
 │  projects · tasks · focus_sessions · window_activity  │
 │  pending_replies · settings                           │
 ├──────────────────────────────────────────────────────┤
@@ -45,13 +45,15 @@ Full CRUD for projects and tasks with priority levels (**A/B/C**), estimated dur
 ### M2 — Natural Language Parsing & AI Scheduling
 Type tasks in plain language — Flowtime parses them into structured items using an OpenAI-compatible LLM (with heuristic fallback). AI also suggests optimal task ordering based on priority, deadlines, and dependencies.
 
+**💡 Works with Ollama**: Set `OLLAMA_API_BASE=http://localhost:11434/v1` to use local models (qwen2.5, llama3, etc.) — no cloud API key needed.
+
 ```
 Input: "明天下午3点前写完Q3规划报告，高优先级，预计2小时"
 Output: ParsedTask { title: "Q3规划报告", priority: "A", duration: 120, deadline: ... }
 ```
 
 ### M3 — Focus Mode
-Start a focus session linked to a task. Records start/end times, blocks interruptions, and tracks how many incoming messages were auto-replied during the session.
+Start a focus session linked to a task. **Pause / Resume** at any time — interruptions are tracked and counted. When you start a session, Flowtime auto-detects if you're in your peak productivity hours and suggests the best time to focus. Records start/end times, blocks interruptions, and tracks how many incoming messages were auto-replied.
 
 ### M4 — Behavior Tracking
 Every 30 seconds, Flowtime logs your active window (app name + title) via `osascript` (macOS). Aggregates into daily time distribution and productivity statistics.
@@ -69,6 +71,18 @@ Returns `ImportResult { tasks, errors }` — partial failures don't block succes
 
 ### M6 — AI Auto-Reply
 When in focus mode, incoming messages trigger an LLM-generated reply draft. Manage drafts through a full lifecycle: **pending → edit → send / discard**. Falls back to bilingual preset replies when LLM is unavailable.
+
+### 📱 Desktop Notifications
+Native OS notifications for deadline approaching and focus session completions.
+
+### ⌨️ Global Keyboard Shortcuts
+`Cmd+Shift+F` — Quick toggle focus mode · `Cmd+Shift+O` — Show/hide Flowtime window
+
+### 📦 Data Export & Import
+Full JSON backup and restore of all data (projects, tasks, focus sessions, settings, window activity). Use for migration, backup, or data portability.
+
+### 🧠 Local LLM Support
+Works with Ollama — set `OLLAMA_API_BASE=http://localhost:11434/v1` and `OLLAMA_MODEL=qwen2.5:7b`. No cloud API key required.
 
 ### M7 — Weekly & Daily Reports
 Dashboard views with:
@@ -127,7 +141,11 @@ npm run tauri dev
 Set these before launching for full functionality:
 
 ```bash
-# Required for AI features (M2, M6)
+# Option A: Local LLM via Ollama (recommended, no API key needed!)
+export OLLAMA_API_BASE="http://localhost:11434/v1"
+export OLLAMA_MODEL="qwen2.5:7b"   # or llama3, mistral, etc.
+
+# Option B: OpenAI (if not using Ollama)
 export OPENAI_API_KEY="sk-..."
 
 # Optional: custom OpenAI-compatible endpoint
@@ -141,7 +159,7 @@ export FEISHU_APP_ID="cli_..."
 export FEISHU_APP_SECRET="..."
 ```
 
-> **Note**: Without `OPENAI_API_KEY`, Flowtime uses heuristic fallback algorithms for task parsing and scheduling. All other features work independently.
+> **Note**: Without any LLM configured, Flowtime uses heuristic fallback algorithms for task parsing and scheduling. All other features work independently.
 
 ---
 
@@ -220,12 +238,17 @@ npm run build
 
 ## Roadmap
 
+- [x] Focus session pause/resume with interruption tracking
+- [x] Desktop notifications for deadline reminders & focus end
+- [x] Global keyboard shortcuts (Cmd+Shift+F / Cmd+Shift+O)
+- [x] Unit tests for core modules (llm, learning, focus)
+- [x] Local LLM support via Ollama
+- [x] Data export/import (JSON backup & restore)
 - [ ] Cross-platform window tracking (Windows / Linux)
-- [ ] Unit & integration test suite
 - [ ] User-defined app category rules
-- [ ] Focus session interruption recovery
-- [ ] Desktop notifications for deadline reminders
 - [ ] Dark mode support
+- [ ] Mobile companion via API server
+- [ ] Intelligent calendar-aware scheduling
 
 ---
 
