@@ -261,6 +261,63 @@ async fn get_efficiency_pattern_inner(
     })
 }
 
+/// Aggregate hourly focus seconds from the last `days` and return peak ranges
+/// using the shared 2-4 hour window algorithm. This is the single source of
+/// truth for "peak hours" consumed by both the learning module and the focus
+/// module (for the start-focus linkage notification).
+pub async fn compute_peak_ranges(pool: &SqlitePool, days: i32) -> Vec<PeakRange> {
+    let days = days.max(1);
+    let since = iso_date(Utc::now().date_naive() - chrono::Duration::days(days as i64));
+    let rows: Vec<(i32, i64)> = sqlx::query_as(
+        "SELECT CAST(strftime('%H', start_time) AS INTEGER) as hr, \
+                CAST((julianday(end_time) - julianday(start_time)) * 86400 AS INTEGER) as secs \
+         FROM focus_sessions \
+         WHERE date(start_time) >= ? AND end_time IS NOT NULL \
+         ORDER BY hr ASC",
+    )
+    .bind(&since)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    use std::collections::HashMap;
+    let mut hour_map: HashMap<i32, i64> = HashMap::new();
+    for (hr, secs) in rows {
+        *hour_map.entry(hr).or_insert(0) += secs;
+    }
+    let hourly: Vec<HourlyFocus> = hour_map
+        .into_iter()
+        .map(|(hour, total_seconds)| HourlyFocus { hour, total_seconds })
+        .collect();
+
+    if let Some(peak) = find_peak_hours(&hourly) {
+        vec![peak]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Cache peak hours into settings for cross-module linkage (focus module reads it).
+pub async fn cache_peak_hours(pool: &SqlitePool) {
+    let peaks = compute_peak_ranges(pool, 14).await;
+    let json = serde_json::to_string(&peaks).unwrap_or_default();
+    let _ = sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('peak_hours_data', ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(&json)
+    .execute(pool)
+    .await;
+
+    let _ = sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('peak_hours_updated_at', ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string())
+    .execute(pool)
+    .await;
+}
+
 /// Return peak hours suggestion for the user.
 #[tauri::command]
 pub async fn get_peak_hours(

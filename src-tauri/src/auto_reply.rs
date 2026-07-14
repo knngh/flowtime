@@ -1,72 +1,10 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sqlx::{SqlitePool, FromRow};
 use chrono::Utc;
 use tauri::State;
 
-// ── LLM helper ──
-
-async fn chat_completion(system_prompt: &str, user_message: &str) -> Result<String, String> {
-    // Check for Ollama first
-    let ollama_base = std::env::var("OLLAMA_API_BASE")
-        .or_else(|_| std::env::var("OLLAMA_HOST"))
-        .unwrap_or_default();
-
-    let (api_base, api_key, model) = if !ollama_base.is_empty() {
-        let m = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5:7b".to_string());
-        (ollama_base.trim_end_matches('/').to_string(), "ollama".to_string(), m)
-    } else {
-        let base = std::env::var("OPENAI_API_BASE")
-            .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-        let key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-        let m = std::env::var("OPENAI_MODEL")
-            .unwrap_or_else(|_| "gpt-4o-mini".to_string());
-        (base, key, m)
-    };
-
-    if api_key.is_empty() {
-        return Err("NO_API_KEY".to_string());
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("CLIENT_ERROR: {}", e))?;
-
-    let request_body = serde_json::json!({
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message}
-        ],
-        "temperature": 0.3
-    });
-
-    let response = client
-        .post(format!("{}/chat/completions", api_base.trim_end_matches('/')))
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&request_body)
-        .send()
-        .await
-        .map_err(|e| format!("NETWORK_ERROR: {}", e))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("API_ERROR: HTTP {} — {}", status, &body[..200.min(body.len())]));
-    }
-
-    let body: Value = response
-        .json()
-        .await
-        .map_err(|e| format!("PARSE_ERROR: {}", e))?;
-
-    body["choices"][0]["message"]["content"]
-        .as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| "EMPTY_RESPONSE".to_string())
-}
+// ── LLM helper (shared with llm.rs) ──
+use crate::llm_common::chat_completion;
 
 // ── Data structures ──
 
@@ -146,6 +84,15 @@ Output ONLY the reply text, no explanation, no quotes, no markdown."#;
     .execute(pool)
     .await
     .map_err(|e| format!("Failed to save pending reply: {}", e))?;
+
+    // P1-1: if a focus session is currently active, count this auto-reply as a
+    // real "blocked interruption" so the metric is no longer always 0.
+    let _ = sqlx::query(
+        "UPDATE focus_sessions SET messages_auto_replied = messages_auto_replied + 1 \
+         WHERE end_time IS NULL",
+    )
+    .execute(pool)
+    .await;
 
     Ok(PendingReply {
         id,

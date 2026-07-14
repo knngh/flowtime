@@ -67,7 +67,7 @@ export default function Timeline({
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
-      <div className="px-6 py-4 border-b border-gray-100 bg-white">
+      <div className="px-6 py-4 border-b border-gray-100 bg-white dark:bg-gray-900 dark:border-gray-800">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <h2 className="text-lg font-semibold">
@@ -134,15 +134,15 @@ export default function Timeline({
               const project = getProject(task.project_id);
               const isFocusingThis = activeFocus?.task_id === task.id;
               return (
-                <div
-                  key={task.id}
-                  className={`group flex items-start gap-3 p-3 rounded-lg border transition-all ${
-                    isFocusingThis
-                      ? 'bg-red-50 border-red-200 shadow-sm'
-                      : 'bg-white border-gray-100 hover:border-gray-200 hover:shadow-sm cursor-pointer'
-                  }`}
-                  onClick={() => !isFocusingThis && onEditTask(task)}
-                >
+                  <div
+                    key={task.id}
+                    className={`group flex items-start gap-3 p-3 rounded-lg border transition-all ${
+                      isFocusingThis
+                        ? 'bg-red-50 border-red-200 shadow-sm dark:bg-red-950/40 dark:border-red-800'
+                        : 'bg-white border-gray-100 hover:border-gray-200 hover:shadow-sm cursor-pointer dark:bg-gray-800 dark:border-gray-700 dark:hover:border-gray-600'
+                    }`}
+                    onClick={() => !isFocusingThis && onEditTask(task)}
+                  >
                   {/* Order indicator when AI ordered */}
                   {isAiOrdered && (
                     <span className="text-[10px] text-purple-400 shrink-0 w-5 text-center leading-6">

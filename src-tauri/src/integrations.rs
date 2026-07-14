@@ -418,3 +418,41 @@ pub async fn import_external_tasks(
         errors,
     })
 }
+
+// ── Unit Tests ──
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_github_priority_urgent() {
+        let labels = vec![GitHubLabel { name: "P0".to_string() }];
+        assert_eq!(github_priority(&labels), "A");
+        let labels = vec![GitHubLabel { name: "critical-bug".to_string() }];
+        assert_eq!(github_priority(&labels), "A");
+    }
+
+    #[test]
+    fn test_github_priority_low() {
+        let labels = vec![GitHubLabel { name: "nice-to-have".to_string() }];
+        assert_eq!(github_priority(&labels), "C");
+        let labels = vec![GitHubLabel { name: "P2".to_string() }];
+        assert_eq!(github_priority(&labels), "C");
+    }
+
+    #[test]
+    fn test_github_priority_default() {
+        let labels = vec![GitHubLabel { name: "bug".to_string() }];
+        assert_eq!(github_priority(&labels), "B");
+    }
+
+    #[test]
+    fn test_linear_priority() {
+        assert_eq!(linear_priority(Some("Urgent")), "A");
+        assert_eq!(linear_priority(Some("High")), "A");
+        assert_eq!(linear_priority(Some("Low")), "C");
+        assert_eq!(linear_priority(Some("Medium")), "B");
+        assert_eq!(linear_priority(None), "B");
+    }
+}

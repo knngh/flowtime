@@ -165,6 +165,37 @@ fn category_of_app(app: &str) -> &'static str {
     }
 }
 
+/// Load user-defined app→category overrides from settings (P3-3).
+async fn load_category_rules(pool: &SqlitePool) -> std::collections::HashMap<String, String> {
+    let raw: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM settings WHERE key = 'app_category_rules' LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    if let Some(json) = raw {
+        if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, String>>(&json) {
+            return map;
+        }
+    }
+    std::collections::HashMap::new()
+}
+
+/// Resolve a category: user rules first, then the built-in heuristic.
+fn categorize(app: &str, rules: &std::collections::HashMap<String, String>) -> String {
+    let a = app.to_lowercase();
+    if let Some(cat) = rules.get(&a) {
+        return cat.clone();
+    }
+    for (k, v) in rules {
+        if !k.is_empty() && a.contains(k) {
+            return v.clone();
+        }
+    }
+    category_of_app(app).to_string()
+}
+
 // ── Tauri Commands ──
 
 #[tauri::command]
@@ -287,7 +318,7 @@ pub async fn get_weekly_report(
     }
 
     let interrupt_rows: Vec<InterruptRow> = sqlx::query_as(
-        "SELECT COALESCE(SUM(interruptions_blocked), 0) as total \
+        "SELECT COALESCE(SUM(interruption_count), 0) as total \
          FROM focus_sessions \
          WHERE date(start_time) >= ? AND date(start_time) <= ?",
     )
@@ -329,9 +360,10 @@ pub async fn get_weekly_report(
     .map_err(|e| format!("DB error: {}", e))?;
 
     use std::collections::HashMap;
-    let mut cat_map: HashMap<&str, i64> = HashMap::new();
+    let rules = load_category_rules(pool).await;
+    let mut cat_map: HashMap<String, i64> = HashMap::new();
     for (app, secs) in dist_rows {
-        let cat = category_of_app(&app);
+        let cat = categorize(&app, &rules);
         *cat_map.entry(cat).or_insert(0) += secs;
     }
     let mut time_distribution: Vec<TimeDistributionItem> = cat_map
@@ -362,10 +394,12 @@ pub async fn get_weekly_report(
     let today = Utc::now().date_naive();
     let threshold = iso_date(today - chrono::Duration::days(3));
 
-    let high_risk: Vec<(String, String, String, String)> = sqlx::query_as(
-        "SELECT id, title, status, created_at FROM tasks \
+    // High-risk = deferred tasks older than 3 days, ordered by how many times
+    // they've been deferred (real `deferred_count` from migration v6).
+    let high_risk: Vec<(String, String, String, String, i32, Option<String>)> = sqlx::query_as(
+        "SELECT id, title, status, created_at, deferred_count, last_deferred_at FROM tasks \
          WHERE status = 'deferred' AND date(created_at) < ? \
-         ORDER BY created_at ASC \
+         ORDER BY deferred_count DESC, created_at ASC \
          LIMIT 20",
     )
     .bind(&threshold)
@@ -373,18 +407,14 @@ pub async fn get_weekly_report(
     .await
     .map_err(|e| format!("DB error: {}", e))?;
 
-    // Also check for tasks that were explicitly deferred multiple times:
-    // We look for tasks whose `updated_at` is much later than `created_at` and status is 'deferred'
-    // For a better heuristic, count how many times status changed to 'deferred' — not tracked in current schema.
-    // So we use: status=='deferred' AND created_at < (today - 3 days)
     let high_risk_tasks: Vec<HighRiskTask> = high_risk
         .into_iter()
-        .map(|(id, title, status, _created_at)| HighRiskTask {
+        .map(|(id, title, status, _created_at, deferred_count, last_deferred_at)| HighRiskTask {
             id,
             title,
             status,
-            deferred_count: 0, // Not tracked in current schema; placeholder
-            last_deferred_at: None,
+            deferred_count,
+            last_deferred_at,
         })
         .collect();
 
@@ -437,9 +467,9 @@ pub async fn get_daily_summary(
         }
     }
 
-    // ── Interruptions ──
+    // ── Interruptions (real: counts pauses during focus) ──
     let interruptions_blocked: i32 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(interruptions_blocked), 0) \
+        "SELECT COALESCE(SUM(interruption_count), 0) \
          FROM focus_sessions \
          WHERE date(start_time) = ?",
     )
@@ -481,9 +511,10 @@ pub async fn get_daily_summary(
     .map_err(|e| format!("DB error: {}", e))?;
 
     use std::collections::HashMap;
-    let mut cat_map: HashMap<&str, i64> = HashMap::new();
+    let rules = load_category_rules(pool).await;
+    let mut cat_map: HashMap<String, i64> = HashMap::new();
     for (app, secs) in dist_rows {
-        let cat = category_of_app(&app);
+        let cat = categorize(&app, &rules);
         *cat_map.entry(cat).or_insert(0) += secs;
     }
     let time_distribution: Vec<TimeDistributionItem> = cat_map
@@ -514,3 +545,132 @@ pub async fn get_daily_summary(
         time_distribution,
     })
 }
+
+// ── Custom app category rules (P3-3) ──
+
+#[tauri::command]
+pub async fn set_app_category(
+    app: String,
+    category: String,
+    state: State<'_, SqlitePool>,
+) -> Result<(), String> {
+    let pool = state.inner();
+    let mut rules = load_category_rules(pool).await;
+    rules.insert(app.to_lowercase(), category);
+    let json = serde_json::to_string(&rules).map_err(|e| format!("serde error: {}", e))?;
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('app_category_rules', ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(&json)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("DB error: {}", e))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_app_categories(
+    state: State<'_, SqlitePool>,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let pool = state.inner();
+    Ok(load_category_rules(pool).await)
+}
+
+/// Remove a single app→category rule (P3-3 settings UI).
+#[tauri::command]
+pub async fn delete_app_category(
+    app: String,
+    state: State<'_, SqlitePool>,
+) -> Result<(), String> {
+    let pool = state.inner();
+    let mut rules = load_category_rules(pool).await;
+    rules.remove(&app.to_lowercase());
+    let json = serde_json::to_string(&rules).map_err(|e| format!("serde error: {}", e))?;
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('app_category_rules', ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(&json)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("DB error: {}", e))?;
+    Ok(())
+}
+
+/// Defer a task: mark as `deferred`, increment the real `deferred_count`, and
+/// record when it was deferred (P1-2).
+#[tauri::command]
+pub async fn defer_task(task_id: String, state: State<'_, SqlitePool>) -> Result<(), String> {
+    let pool = state.inner();
+    sqlx::query(
+        "UPDATE tasks SET status = 'deferred', deferred_count = deferred_count + 1, \
+         last_deferred_at = ?, updated_at = datetime('now') WHERE id = ?",
+    )
+    .bind(Utc::now().to_rfc3339())
+    .bind(&task_id)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("DB error: {}", e))?;
+    Ok(())
+}
+
+// ── Unit Tests ──
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_category_of_app_coding() {
+        assert_eq!(category_of_app("Visual Studio Code"), "coding");
+        assert_eq!(category_of_app("Cursor"), "coding");
+        assert_eq!(category_of_app("iTerm2"), "coding");
+    }
+
+    #[test]
+    fn test_category_of_app_meeting() {
+        assert_eq!(category_of_app("Zoom"), "meeting");
+        assert_eq!(category_of_app("腾讯会议"), "meeting");
+    }
+
+    #[test]
+    fn test_category_of_app_communication() {
+        assert_eq!(category_of_app("WeChat"), "communication");
+        assert_eq!(category_of_app("Slack"), "communication");
+    }
+
+    #[test]
+    fn test_category_of_app_other() {
+        assert_eq!(category_of_app("Calculator"), "other");
+        assert_eq!(category_of_app("Finder"), "other");
+    }
+
+    #[test]
+    fn test_week_bounds_monday() {
+        // 2026-07-13 is a Monday
+        let d = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap();
+        let (start, end) = week_bounds(d);
+        assert_eq!(start, d);
+        assert_eq!(end, NaiveDate::from_ymd_opt(2026, 7, 19).unwrap());
+    }
+
+    #[test]
+    fn test_week_bounds_sunday() {
+        // 2026-07-19 is a Sunday → week starts 2026-07-13
+        let d = NaiveDate::from_ymd_opt(2026, 7, 19).unwrap();
+        let (start, _) = week_bounds(d);
+        assert_eq!(start, NaiveDate::from_ymd_opt(2026, 7, 13).unwrap());
+    }
+
+    #[test]
+    fn test_categorize_user_rule_wins() {
+        use std::collections::HashMap;
+        let mut rules = HashMap::new();
+        rules.insert("spotify".to_string(), "focus-music".to_string());
+        assert_eq!(categorize("Spotify", &rules), "focus-music");
+        // Fallback when no rule
+        assert_eq!(categorize("Calculator", &rules), "other");
+    }
+}
+

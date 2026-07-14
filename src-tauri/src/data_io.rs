@@ -267,3 +267,73 @@ pub async fn import_all_data(
 
     Ok(result)
 }
+
+// ── Unit Tests ──
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_export_import_roundtrip() {
+        let export = DataExport {
+            version: "1.0.0".to_string(),
+            exported_at: "2026-06-13T08:00:00Z".to_string(),
+            projects: vec![ProjectExport {
+                id: "p1".to_string(),
+                name: "Work".to_string(),
+                color: "#3B82F6".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+            }],
+            tasks: vec![TaskExport {
+                id: "t1".to_string(),
+                title: "Task".to_string(),
+                priority: "A".to_string(),
+                estimated_duration_min: 60,
+                source: "manual".to_string(),
+                source_url: None,
+                project_id: Some("p1".to_string()),
+                tags: "[]".to_string(),
+                status: "todo".to_string(),
+                scheduled_start: None,
+                scheduled_end: None,
+                actual_start: None,
+                actual_end: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+            }],
+            focus_sessions: vec![FocusSessionExport {
+                id: "f1".to_string(),
+                task_id: None,
+                start_time: "2026-01-01T09:00:00Z".to_string(),
+                end_time: None,
+                interruptions_blocked: 0,
+                messages_auto_replied: 0,
+                status: "active".to_string(),
+                interruption_count: 0,
+            }],
+            settings: vec![SettingExport {
+                key: "k".to_string(),
+                value: "v".to_string(),
+            }],
+            window_activity: vec![WindowActivityExport {
+                id: 1,
+                date: "2026-01-01".to_string(),
+                app_name: "Code".to_string(),
+                window_title: "".to_string(),
+                duration_seconds: 30,
+                recorded_at: "2026-01-01T09:00:30Z".to_string(),
+            }],
+        };
+
+        let json = serde_json::to_string_pretty(&export).unwrap();
+        let back: DataExport = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string_pretty(&back).unwrap();
+        assert_eq!(json, json2);
+        assert_eq!(back.version, "1.0.0");
+        assert_eq!(back.tasks.len(), 1);
+        assert_eq!(back.tasks[0].project_id, Some("p1".to_string()));
+        assert_eq!(back.focus_sessions[0].status, "active");
+    }
+}

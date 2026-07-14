@@ -1,11 +1,14 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
-import type { Project, Task, ParsedTask, ActiveFocusSession, FocusSessionSummary, ExternalTask, PendingReply, PeakHoursSuggestion } from './types';
+import type { Project, Task, ParsedTask, ActiveFocusSession, FocusSessionSummary, StartFocusResult, ExternalTask, PendingReply, PeakHoursSuggestion } from './types';
 import { getProjects, createProject, renameProject, deleteProject, getTasks, createTask, updateTask } from './db';
 import { parseNaturalLanguage, suggestSchedule } from './llm';
-import { startFocusSession, endFocusSession, getActiveFocusSession } from './focus';
+import { startFocusSession, endFocusSession, getActiveFocusSession, pauseFocusSession, resumeFocusSession } from './focus';
 import { trackWindowActivity, getFrontmostApp } from './tracking';
 import { getPendingReplies, generateAutoReply } from './auto_reply';
 import { getPeakHours, calibrateEstimate, getCalibrationRatio } from './learning';
+import { register, unregister } from '@tauri-apps/plugin-global-shortcut';
+import { isPermissionGranted, requestPermission } from '@tauri-apps/plugin-notification';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import Sidebar from './components/Sidebar';
 import Timeline from './components/Timeline';
 import TaskModal from './components/TaskModal';
@@ -13,6 +16,7 @@ import FocusMode from './components/FocusMode';
 import IntegrationsPanel from './components/IntegrationsPanel';
 import AutoReplyPanel from './components/AutoReplyPanel';
 import WeeklyReport from './components/WeeklyReport';
+import SettingsModal from './components/SettingsModal';
 
 export default function App() {
   const [projects, setProjects] = useState<Project[]>([]);
@@ -33,6 +37,9 @@ export default function App() {
   // M3: Focus mode state
   const [activeFocus, setActiveFocus] = useState<ActiveFocusSession | null>(null);
   const [focusSummary, setFocusSummary] = useState<FocusSessionSummary | null>(null);
+  const [peakNote, setPeakNote] = useState<string | null>(null);
+  const activeFocusRef = useRef<ActiveFocusSession | null>(null);
+  activeFocusRef.current = activeFocus;
 
   // M4: Tracking ref
   const trackingRef = useRef<ReturnType<typeof setInterval>>(null);
@@ -53,6 +60,17 @@ export default function App() {
   // M8: Behavior learning state
   const [peakHours, setPeakHours] = useState<PeakHoursSuggestion | null>(null);
   const [calibrationRatio, setCalibrationRatio] = useState<number>(1.0);
+
+  // M9: Theme + settings (P3-3)
+  const [theme, setTheme] = useState<'light' | 'dark'>(
+    () => (localStorage.getItem('flowtime-theme') === 'dark' ? 'dark' : 'light'),
+  );
+  const [showSettings, setShowSettings] = useState(false);
+
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', theme === 'dark');
+    localStorage.setItem('flowtime-theme', theme);
+  }, [theme]);
 
   const loadData = useCallback(async (pid: string | null) => {
     const projList = await getProjects();
@@ -98,6 +116,54 @@ export default function App() {
     getPeakHours().then(setPeakHours).catch(() => {});
     getCalibrationRatio().then(setCalibrationRatio).catch(() => {});
   }, []);
+
+  // ── P0-4: Request notification permission once on startup ──
+  useEffect(() => {
+    (async () => {
+      try {
+        const granted = await isPermissionGranted();
+        if (!granted) await requestPermission();
+      } catch {
+        // Notifications may be unavailable; ignore.
+      }
+    })();
+  }, []);
+
+  // ── P0-3: Global shortcuts (registered from the frontend, version-stable) ──
+  useEffect(() => {
+    const f = 'CmdOrCtrl+Shift+F';
+    const o = 'CmdOrCtrl+Shift+O';
+    (async () => {
+      try {
+        await register(f, () => {
+          // Start (or refocus) a focus session; ignore if one is already active.
+          if (activeFocusRef.current) return;
+          handleQuickStartFocus();
+        });
+      } catch (e) {
+        console.warn('Failed to register focus shortcut:', e);
+      }
+      try {
+        await register(o, () => {
+          getCurrentWindow().show().catch(() => {});
+          getCurrentWindow().setFocus().catch(() => {});
+        });
+      } catch (e) {
+        console.warn('Failed to register window shortcut:', e);
+      }
+    })();
+    return () => {
+      unregister(f).catch(() => {});
+      unregister(o).catch(() => {});
+    };
+  }, []);
+
+  // ── P0-1: Peak-hours linkage note auto-dismiss ──
+  useEffect(() => {
+    if (!peakNote) return;
+    const t = setTimeout(() => setPeakNote(null), 6000);
+    return () => clearTimeout(t);
+  }, [peakNote]);
 
   // ── Project handlers ──
 
@@ -188,22 +254,60 @@ export default function App() {
 
   // ── M3: Focus handlers ──
 
+  const applyFocusResult = (res: StartFocusResult, taskId: string | null, taskTitle: string | null) => {
+    const now = new Date().toISOString();
+    setActiveFocus({
+      id: res.session_id,
+      task_id: taskId,
+      task_title: taskTitle,
+      start_time: now,
+      status: 'active',
+      interruption_count: 0,
+      elapsed_seconds: 0,
+    });
+    setPeakNote(res.peak_hours_note);
+  };
+
   const handleStartFocus = async (taskId: string, taskTitle: string) => {
     try {
-      const sessionId = await startFocusSession(taskId);
-      const now = new Date().toISOString();
-      setActiveFocus({
-        id: sessionId,
-        task_id: taskId,
-        task_title: taskTitle,
-        start_time: now,
-      });
+      const res = await startFocusSession(taskId);
+      applyFocusResult(res, taskId, taskTitle);
     } catch (err) {
       console.error('Failed to start focus:', err);
     }
   };
 
-  const handleEndFocus = async (_summary: FocusSessionSummary) => {
+  // P0-3: keyboard-shortcut entry — focus without binding a specific task.
+  const handleQuickStartFocus = async () => {
+    try {
+      const res = await startFocusSession(null);
+      applyFocusResult(res, null, null);
+    } catch (err) {
+      console.error('Quick-start focus failed:', err);
+    }
+  };
+
+  const handlePauseFocus = async () => {
+    if (!activeFocus) return;
+    try {
+      await pauseFocusSession(activeFocus.id);
+      setActiveFocus((f) => (f ? { ...f, status: 'paused' } : f));
+    } catch (err) {
+      console.error('Failed to pause focus:', err);
+    }
+  };
+
+  const handleResumeFocus = async () => {
+    if (!activeFocus) return;
+    try {
+      await resumeFocusSession(activeFocus.id);
+      setActiveFocus((f) => (f ? { ...f, status: 'active' } : f));
+    } catch (err) {
+      console.error('Failed to resume focus:', err);
+    }
+  };
+
+  const handleEndFocus = async () => {
     if (!activeFocus) return;
     try {
       const result = await endFocusSession(activeFocus.id);
@@ -305,7 +409,7 @@ export default function App() {
     : tasks;
 
   return (
-    <div className="flex h-screen bg-gray-50 text-gray-900">
+    <div className="flex h-screen bg-gray-50 text-gray-900 dark:bg-gray-950 dark:text-gray-100">
       <Sidebar
         projects={projects}
         activeProjectId={activeProjectId}
@@ -318,6 +422,7 @@ export default function App() {
         onIntegrations={() => setShowIntegrations(true)}
         onAutoReply={() => setShowAutoReply(true)}
         onReview={() => setShowReview(true)}
+        onSettings={() => setShowSettings(true)}
         pendingReplyCount={pendingReplies.length}
       />
       <main className="flex-1 flex flex-col overflow-hidden">
@@ -374,10 +479,22 @@ export default function App() {
       {/* M3: Focus mode overlay */}
       {activeFocus && (
         <FocusMode
+          sessionId={activeFocus.id}
+          taskId={activeFocus.task_id}
           taskTitle={activeFocus.task_title}
           startTime={activeFocus.start_time}
+          status={activeFocus.status}
           onEnd={handleEndFocus}
+          onPause={handlePauseFocus}
+          onResume={handleResumeFocus}
         />
+      )}
+
+      {/* P0-1: Peak-hours linkage note (auto-dismiss) */}
+      {peakNote && (
+        <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[60] px-4 py-2 rounded-full bg-amber-100 text-amber-800 text-sm shadow-md border border-amber-200 dark:bg-amber-900/60 dark:text-amber-100 dark:border-amber-700">
+          {peakNote}
+        </div>
       )}
 
       {/* M3: Focus summary dialog */}
@@ -521,6 +638,16 @@ export default function App() {
 
       {/* M7: Weekly report dashboard */}
       {showReview && <WeeklyReport onClose={() => setShowReview(false)} />}
+
+      {/* M9: Settings (theme + app categories) */}
+      {showSettings && (
+        <SettingsModal
+          isOpen={showSettings}
+          theme={theme}
+          onToggleTheme={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
+          onClose={() => setShowSettings(false)}
+        />
+      )}
     </div>
   );
 }

@@ -1,10 +1,14 @@
 import { useState, useEffect, useRef } from 'react';
-import type { FocusSessionSummary } from '../types';
 
 interface FocusModeProps {
+  sessionId: string;
+  taskId: string | null;
   taskTitle: string | null;
   startTime: string;
-  onEnd: (summary: FocusSessionSummary) => void;
+  status: string;
+  onEnd: () => void;
+  onPause: () => void;
+  onResume: () => void;
 }
 
 function formatDuration(totalSeconds: number): string {
@@ -14,53 +18,85 @@ function formatDuration(totalSeconds: number): string {
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 }
 
-export default function FocusMode({ taskTitle, startTime, onEnd }: FocusModeProps) {
+export default function FocusMode({
+  taskTitle,
+  startTime,
+  status,
+  onEnd,
+  onPause,
+  onResume,
+}: FocusModeProps) {
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
-  const timerRef = useRef<ReturnType<typeof setInterval>>(null);
+  const baseRef = useRef(0); // seconds accumulated before the current active period
+  const elapsedRef = useRef(0);
+  const periodStartRef = useRef(Date.now());
 
   useEffect(() => {
-    const startMs = new Date(startTime).getTime();
-    const tick = () => {
-      setElapsedSeconds(Math.floor((Date.now() - startMs) / 1000));
+    if (status === 'active') {
+      periodStartRef.current = Date.now();
+      const id = setInterval(() => {
+        const secs =
+          baseRef.current + Math.floor((Date.now() - periodStartRef.current) / 1000);
+        elapsedRef.current = secs;
+        setElapsedSeconds(secs);
+      }, 1000);
+      setElapsedSeconds(baseRef.current);
+      return () => clearInterval(id);
+    }
+    // paused: freeze the displayed elapsed time
+    baseRef.current = elapsedRef.current;
+  }, [status, startTime]);
+
+  // Esc ends the session
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onEnd();
     };
-    tick();
-    timerRef.current = setInterval(tick, 1000);
-    return () => {
-      if (timerRef.current) clearInterval(timerRef.current);
-    };
-  }, [startTime]);
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onEnd]);
+
+  const isPaused = status === 'paused';
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
       <div className="flex flex-col items-center gap-6 text-white">
-        {/* Task name */}
         <div className="text-center">
-          <p className="text-sm text-white/50 mb-1 tracking-widest uppercase">专注中</p>
+          <p className="text-sm text-white/50 mb-1 tracking-widest uppercase">
+            {isPaused ? '已暂停' : '专注中'}
+          </p>
           <h1 className="text-2xl font-semibold max-w-md truncate">
             {taskTitle || '无任务'}
           </h1>
         </div>
 
-        {/* Timer */}
         <div className="text-7xl font-mono font-light tracking-wider tabular-nums">
           {formatDuration(elapsedSeconds)}
         </div>
 
-        {/* End button */}
-        <button
-          className="mt-4 px-8 py-3 bg-white/15 hover:bg-white/25 text-white rounded-xl text-base font-medium border border-white/20 transition-all backdrop-blur"
-          onClick={() => {
-            onEnd({
-              session_id: '',
-              task_id: null,
-              duration_seconds: elapsedSeconds,
-              interruptions_blocked: 0,
-              messages_auto_replied: 0,
-            });
-          }}
-        >
-          结束专注
-        </button>
+        <div className="flex items-center gap-3">
+          {isPaused ? (
+            <button
+              className="px-6 py-3 bg-green-500/90 hover:bg-green-500 text-white rounded-xl text-base font-medium transition-all"
+              onClick={onResume}
+            >
+              继续专注
+            </button>
+          ) : (
+            <button
+              className="px-6 py-3 bg-white/15 hover:bg-white/25 text-white rounded-xl text-base font-medium border border-white/20 transition-all"
+              onClick={onPause}
+            >
+              暂停
+            </button>
+          )}
+          <button
+            className="px-8 py-3 bg-white/15 hover:bg-white/25 text-white rounded-xl text-base font-medium border border-white/20 transition-all backdrop-blur"
+            onClick={onEnd}
+          >
+            结束专注
+          </button>
+        </div>
 
         <p className="text-xs text-white/30 mt-2">按 Esc 也可结束</p>
       </div>

@@ -1,7 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{SqlitePool, FromRow};
-use tauri::State;
+use tauri::{AppHandle, State};
+use tauri_plugin_notification::NotificationExt;
 
 #[derive(Debug, Serialize, Deserialize, FromRow)]
 pub struct FocusSessionRow {
@@ -71,8 +72,34 @@ struct StartTimeRow {
 
 // ── Helpers ──
 
+/// Parse hour from a peak range JSON and check membership (pure, testable).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PeakRangeData {
+    pub start_hour: i32,
+    pub end_hour: i32,
+}
+
+/// Pure helper: is `hour` inside any of the given peak ranges?
+/// Handles ranges that wrap past midnight (start_hour > end_hour), which
+/// `find_peak_hours` can produce when the strongest block straddles 00:00.
+fn hour_in_peak(hour: i32, ranges: &[PeakRangeData]) -> Option<PeakRangeData> {
+    for r in ranges {
+        let in_range = if r.start_hour <= r.end_hour {
+            hour >= r.start_hour && hour <= r.end_hour
+        } else {
+            // Wraps midnight, e.g. 23:00–01:00
+            hour >= r.start_hour || hour <= r.end_hour
+        };
+        if in_range {
+            return Some(r.clone());
+        }
+    }
+    None
+}
+
 /// Check if current time is within user's peak productivity hours.
-/// Returns (in_peak, note).
+/// Returns (in_peak, note). Reads `peak_hours_data` from settings (single source
+/// of truth, maintained by the learning module via `compute_peak_ranges`).
 async fn check_peak_hours(pool: &SqlitePool) -> (bool, Option<String>) {
     let now = Utc::now();
     let current_hour = now.format("%H").to_string().parse::<i32>().unwrap_or(-1);
@@ -80,7 +107,6 @@ async fn check_peak_hours(pool: &SqlitePool) -> (bool, Option<String>) {
         return (false, None);
     }
 
-    // Read peak hours from settings (stored by learning module)
     let peak_data: Option<String> = sqlx::query_scalar(
         "SELECT value FROM settings WHERE key = 'peak_hours_data' LIMIT 1",
     )
@@ -91,18 +117,16 @@ async fn check_peak_hours(pool: &SqlitePool) -> (bool, Option<String>) {
 
     if let Some(data) = peak_data {
         if let Ok(ranges) = serde_json::from_str::<Vec<PeakRangeData>>(&data) {
-            for range in &ranges {
-                if current_hour >= range.start_hour && current_hour <= range.end_hour {
-                    let hour_str = if range.start_hour == range.end_hour {
-                        format!("{}:00-{:02}:00", range.start_hour, (range.start_hour + 1) % 24)
-                    } else {
-                        format!("{}:00-{:02}:00", range.start_hour, (range.end_hour + 1) % 24)
-                    };
-                    return (true, Some(format!(
-                        "💡 现在是你的高效时段（{}），专注效果最佳！",
-                        hour_str
-                    )));
-                }
+            if let Some(range) = hour_in_peak(current_hour, &ranges) {
+                let hour_str = if range.start_hour == range.end_hour {
+                    format!("{}:00-{:02}:00", range.start_hour, (range.start_hour + 1) % 24)
+                } else {
+                    format!("{}:00-{:02}:00", range.start_hour, (range.end_hour + 1) % 24)
+                };
+                return (true, Some(format!(
+                    "💡 现在是你的高效时段（{}），专注效果最佳！",
+                    hour_str
+                )));
             }
         }
     }
@@ -110,19 +134,11 @@ async fn check_peak_hours(pool: &SqlitePool) -> (bool, Option<String>) {
     (false, None)
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct PeakRangeData {
-    start_hour: i32,
-    end_hour: i32,
-}
-
 // ── Tauri Commands ──
 
 /// Get the user's peak hours insight (standalone, for frontend to display).
 #[tauri::command]
-pub async fn get_focus_insight(
-    state: State<'_, SqlitePool>,
-) -> Result<Option<String>, String> {
+pub async fn get_focus_insight(state: State<'_, SqlitePool>) -> Result<Option<String>, String> {
     let pool = state.inner();
     let (_, note) = check_peak_hours(pool).await;
     Ok(note)
@@ -136,13 +152,12 @@ pub async fn start_focus_session(
     let pool = state.inner();
 
     // Prevent duplicate: check for active (not completed, not paused) session
-    let existing: Option<IdRow> =
-        sqlx::query_as::<_, IdRow>(
-            "SELECT id FROM focus_sessions WHERE end_time IS NULL AND status != 'paused' LIMIT 1"
-        )
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| format!("DB error: {}", e))?;
+    let existing: Option<IdRow> = sqlx::query_as::<_, IdRow>(
+        "SELECT id FROM focus_sessions WHERE end_time IS NULL AND status != 'paused' LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("DB error: {}", e))?;
     if existing.is_some() {
         return Err("已有活跃的专注会话，请先结束或暂停当前专注".to_string());
     }
@@ -160,7 +175,7 @@ pub async fn start_focus_session(
     .await
     .map_err(|e| format!("Failed to create focus session: {}", e))?;
 
-    // Check peak hours linkage
+    // Check peak hours linkage (single algorithm in learning module)
     let (in_peak, peak_note) = check_peak_hours(pool).await;
 
     Ok(StartFocusResult {
@@ -177,6 +192,7 @@ pub async fn pause_focus_session(
 ) -> Result<(), String> {
     let pool = state.inner();
 
+    // A pause is a manual interruption — increment interruption_count only.
     let result = sqlx::query(
         "UPDATE focus_sessions SET status = 'paused', interruption_count = interruption_count + 1 \
          WHERE id = ? AND end_time IS NULL AND status = 'active'",
@@ -202,14 +218,13 @@ pub async fn resume_focus_session(
     let pool = state.inner();
 
     // Check no other active session exists
-    let existing: Option<IdRow> =
-        sqlx::query_as::<_, IdRow>(
-            "SELECT id FROM focus_sessions WHERE end_time IS NULL AND status = 'active' AND id != ? LIMIT 1"
-        )
-        .bind(&session_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| format!("DB error: {}", e))?;
+    let existing: Option<IdRow> = sqlx::query_as::<_, IdRow>(
+        "SELECT id FROM focus_sessions WHERE end_time IS NULL AND status = 'active' AND id != ? LIMIT 1",
+    )
+    .bind(&session_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("DB error: {}", e))?;
     if existing.is_some() {
         return Err("已有其他活跃的专注会话，请先结束它".to_string());
     }
@@ -233,6 +248,7 @@ pub async fn resume_focus_session(
 
 #[tauri::command]
 pub async fn end_focus_session(
+    app: AppHandle,
     session_id: String,
     state: State<'_, SqlitePool>,
 ) -> Result<FocusSessionSummary, String> {
@@ -257,7 +273,7 @@ pub async fn end_focus_session(
     let duration_seconds = (end_time - start_time).num_seconds().max(0);
 
     sqlx::query(
-        "UPDATE focus_sessions SET end_time = ?, status = 'completed' WHERE id = ?"
+        "UPDATE focus_sessions SET end_time = ?, status = 'completed' WHERE id = ?",
     )
     .bind(end_time.to_rfc3339())
     .bind(&session_id)
@@ -265,8 +281,17 @@ pub async fn end_focus_session(
     .await
     .map_err(|e| format!("Failed to end focus session: {}", e))?;
 
-    // Cache peak hours data for future linkage (via learning module)
-    cache_peak_hours_if_stale(pool).await;
+    // Refresh peak-hours cache (single algorithm in learning module).
+    crate::learning::cache_peak_hours(pool).await;
+
+    // Desktop notification (P0-4): confirm the completed session.
+    let mins = duration_seconds / 60;
+    let _ = app
+        .notification()
+        .builder()
+        .title("专注结束")
+        .body(format!("本次专注 {} 分钟，继续保持专注节奏！", mins))
+        .show();
 
     Ok(FocusSessionSummary {
         session_id: session.id,
@@ -279,119 +304,33 @@ pub async fn end_focus_session(
     })
 }
 
-/// Periodically refresh peak_hours_data in settings for cross-module linkage.
-async fn cache_peak_hours_if_stale(pool: &SqlitePool) {
-    // Check if we have recent peak data (last 24h)
-    let has_recent: bool = sqlx::query_scalar::<_, String>(
-        "SELECT value FROM settings WHERE key = 'peak_hours_updated_at' LIMIT 1",
-    )
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten()
-    .and_then(|s| {
-        let then = chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S").ok()?;
-        let age = Utc::now().naive_utc() - then;
-        Some(age.num_hours() < 24)
-    })
-    .unwrap_or(false);
-
-    if has_recent {
-        return;
-    }
-
-    // Recalculate peak hours from focus_sessions (last 14 days)
-    let since = (Utc::now().date_naive() - chrono::Duration::days(14)).to_string();
-    let rows: Vec<(i32, i64)> = sqlx::query_as(
-        "SELECT CAST(strftime('%H', start_time) AS INTEGER) as hr, \
-                CAST((julianday(end_time) - julianday(start_time)) * 86400 AS INTEGER) as secs \
-         FROM focus_sessions \
-         WHERE date(start_time) >= ? AND end_time IS NOT NULL \
-         ORDER BY hr ASC",
-    )
-    .bind(&since)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
-
-    if rows.is_empty() {
-        return;
-    }
-
-    use std::collections::HashMap;
-    let mut hour_map: HashMap<i32, i64> = HashMap::new();
-    for (hr, secs) in rows {
-        *hour_map.entry(hr).or_insert(0) += secs;
-    }
-
-    let mut hourly: Vec<(i32, i64)> = hour_map.into_iter().collect();
-    hourly.sort_by_key(|(h, _)| *h);
-
-    // Simple peak detection: sliding window of 2 hours
-    let mut best_hour = 8;
-    let mut best_sum = 0i64;
-    for i in 0..24 {
-        let sum = hourly.iter()
-            .filter(|(h, _)| *h == i || *h == (i + 1) % 24)
-            .map(|(_, s)| s)
-            .sum();
-        if sum > best_sum {
-            best_sum = sum;
-            best_hour = i;
-        }
-    }
-
-    let peaks = vec![PeakRangeData {
-        start_hour: best_hour,
-        end_hour: (best_hour + 1) % 24,
-    }];
-
-    let _ = sqlx::query(
-        "INSERT INTO settings (key, value) VALUES ('peak_hours_data', ?) \
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .bind(serde_json::to_string(&peaks).unwrap_or_default())
-    .execute(pool)
-    .await;
-
-    let _ = sqlx::query(
-        "INSERT INTO settings (key, value) VALUES ('peak_hours_updated_at', ?) \
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .bind(Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string())
-    .execute(pool)
-    .await;
-}
-
 #[tauri::command]
 pub async fn get_active_focus_session(
     state: State<'_, SqlitePool>,
 ) -> Result<Option<ActiveFocusSession>, String> {
     let pool = state.inner();
 
-    let row: Option<ActiveSessionRow> =
-        sqlx::query_as::<_, ActiveSessionRow>(
-            "SELECT id, task_id, start_time, status, interruption_count \
-             FROM focus_sessions WHERE end_time IS NULL LIMIT 1"
-        )
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| format!("DB error: {}", e))?;
+    let row: Option<ActiveSessionRow> = sqlx::query_as::<_, ActiveSessionRow>(
+        "SELECT id, task_id, start_time, status, interruption_count \
+         FROM focus_sessions WHERE end_time IS NULL LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("DB error: {}", e))?;
 
     match row {
         Some(r) => {
             let task_title = if let Some(ref tid) = r.task_id {
-                let title_row: Option<TaskTitleRow> =
-                    sqlx::query_as::<_, TaskTitleRow>(
-                        "SELECT title FROM tasks WHERE id = ?"
-                    )
-                    .bind(tid)
-                    .fetch_optional(pool)
-                    .await
-                    .unwrap_or_else(|e| {
-                        log::warn!("[focus] Failed to fetch task title: {}", e);
-                        None
-                    });
+                let title_row: Option<TaskTitleRow> = sqlx::query_as::<_, TaskTitleRow>(
+                    "SELECT title FROM tasks WHERE id = ?",
+                )
+                .bind(tid)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or_else(|e| {
+                    log::warn!("[focus] Failed to fetch task title: {}", e);
+                    None
+                });
                 title_row.map(|t| t.title)
             } else {
                 None
@@ -413,5 +352,54 @@ pub async fn get_active_focus_session(
             }))
         }
         None => Ok(None),
+    }
+}
+
+// ── Unit Tests ──
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hour_in_peak_single() {
+        let ranges = vec![PeakRangeData {
+            start_hour: 9,
+            end_hour: 11,
+        }];
+        assert!(hour_in_peak(9, &ranges).is_some());
+        assert!(hour_in_peak(11, &ranges).is_some());
+        assert!(hour_in_peak(12, &ranges).is_none());
+    }
+
+    #[test]
+    fn test_hour_in_peak_wrap() {
+        // {23,1} is inclusive of end_hour (hours 23, 0, 1) — matches
+        // find_peak_hours, which returns end_hour as the last covered hour.
+        let ranges = vec![PeakRangeData {
+            start_hour: 23,
+            end_hour: 1,
+        }];
+        assert!(hour_in_peak(23, &ranges).is_some());
+        assert!(hour_in_peak(0, &ranges).is_some());
+        assert!(hour_in_peak(1, &ranges).is_some());
+        assert!(hour_in_peak(2, &ranges).is_none());
+        assert!(hour_in_peak(12, &ranges).is_none());
+    }
+
+    #[test]
+    fn test_hour_in_peak_multiple() {
+        let ranges = vec![
+            PeakRangeData {
+                start_hour: 9,
+                end_hour: 11,
+            },
+            PeakRangeData {
+                start_hour: 14,
+                end_hour: 16,
+            },
+        ];
+        assert!(hour_in_peak(15, &ranges).is_some());
+        assert!(hour_in_peak(13, &ranges).is_none());
     }
 }

@@ -26,12 +26,6 @@
       "permission": {
         "default": "granted"
       }
-    },
-    "global-shortcut": {
-      "shortcuts": [
-        "CmdOrCtrl+Shift+F",
-        "CmdOrCtrl+Shift+O"
-      ]
     }
   },
   "bundle": {

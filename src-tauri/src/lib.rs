@@ -1,4 +1,6 @@
+use chrono::Utc;
 use tauri::Manager;
+use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_sql::{Builder, Migration, MigrationKind};
 
 mod api;
@@ -8,6 +10,7 @@ mod focus;
 mod integrations;
 mod learning;
 mod llm;
+mod llm_common;
 mod review;
 mod tracking;
 
@@ -72,6 +75,50 @@ fn validate_environment() {
         log::info!("ℹ️  以下可选集成未配置（不影响核心功能）：");
         for (var, desc) in optional_missing {
             log::info!("   • {} —— {}", var, desc);
+        }
+    }
+}
+
+/// Background loop: remind the user about tasks due within the next 2 hours
+/// (P0-4). `scheduled_end` is populated by the AI scheduler (P3-1).
+async fn run_deadline_checker(pool: sqlx::SqlitePool, app: tauri::AppHandle) {
+    use std::collections::HashSet;
+    let mut notified: HashSet<String> = HashSet::new();
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(900));
+    loop {
+        interval.tick().await;
+        let now = Utc::now();
+        let now_iso = now.to_rfc3339();
+        let soon = (now + chrono::Duration::hours(2)).to_rfc3339();
+
+        #[derive(sqlx::FromRow)]
+        struct DueRow {
+            id: String,
+            title: String,
+        }
+
+        let rows: Vec<DueRow> = sqlx::query_as(
+            "SELECT id, title FROM tasks \
+             WHERE scheduled_end IS NOT NULL AND status != 'done' \
+               AND scheduled_end >= ? AND scheduled_end <= ?",
+        )
+        .bind(&now_iso)
+        .bind(&soon)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+
+        for r in rows {
+            if notified.contains(&r.id) {
+                continue;
+            }
+            notified.insert(r.id.clone());
+            let _ = app
+                .notification()
+                .builder()
+                .title("任务即将截止")
+                .body(format!("「{}」将在 2 小时内到截止时间", r.title))
+                .show();
         }
     }
 }
@@ -181,6 +228,15 @@ pub fn run() {
             UPDATE focus_sessions SET status = 'completed' WHERE end_time IS NOT NULL;
         ",
         },
+        Migration {
+            version: 6,
+            description: "add deferred_count and last_deferred_at to tasks",
+            kind: MigrationKind::Up,
+            sql: "
+            ALTER TABLE tasks ADD COLUMN deferred_count INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE tasks ADD COLUMN last_deferred_at TEXT;
+        ",
+        },
     ];
 
     let sql_plugin = Builder::default()
@@ -190,20 +246,9 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
-        .plugin(
-            tauri_plugin_global_shortcut::Builder::new()
-                .with_shortcuts([
-                    tauri_plugin_global_shortcut::Shortcut::new(
-                        Some(tauri_plugin_global_shortcut::Modifiers::SUPER | tauri_plugin_global_shortcut::Modifiers::SHIFT),
-                        tauri_plugin_global_shortcut::Code::KeyF,
-                    ),
-                    tauri_plugin_global_shortcut::Shortcut::new(
-                        Some(tauri_plugin_global_shortcut::Modifiers::SUPER | tauri_plugin_global_shortcut::Modifiers::SHIFT),
-                        tauri_plugin_global_shortcut::Code::KeyO,
-                    ),
-                ])
-                .build(),
-        )
+        // Shortcuts are registered from the frontend (plugin-global-shortcut JS API)
+        // so the handler logic lives with the UI and is version-stable.
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(sql_plugin)
         .setup(|app| {
             // Initialize logger
@@ -214,9 +259,23 @@ pub fn run() {
             validate_environment();
 
             let pool = app.state::<sqlx::SqlitePool>().inner().clone();
-            tauri::async_runtime::spawn(async move {
-                api::start_api_server(pool).await;
+            let app_handle = app.handle().clone();
+
+            tauri::async_runtime::spawn({
+                let pool = pool.clone();
+                async move {
+                    api::start_api_server(pool).await;
+                }
             });
+
+            tauri::async_runtime::spawn({
+                let pool = pool.clone();
+                let app_handle = app_handle.clone();
+                async move {
+                    run_deadline_checker(pool, app_handle).await;
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -250,6 +309,10 @@ pub fn run() {
             // M7: Review dashboard
             review::get_weekly_report,
             review::get_daily_summary,
+            review::set_app_category,
+            review::get_app_categories,
+            review::delete_app_category,
+            review::defer_task,
             // M8: Behavior learning
             learning::get_efficiency_pattern,
             learning::calibrate_estimate,

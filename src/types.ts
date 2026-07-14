@@ -39,6 +39,9 @@ export interface ActiveFocusSession {
   task_id: string | null;
   task_title: string | null;
   start_time: string;
+  status: string;
+  interruption_count: number;
+  elapsed_seconds: number | null;
 }
 
 export interface FocusSessionSummary {
@@ -47,6 +50,14 @@ export interface FocusSessionSummary {
   duration_seconds: number;
   interruptions_blocked: number;
   messages_auto_replied: number;
+  status: string;
+  interruption_count: number;
+}
+
+export interface StartFocusResult {
+  session_id: string;
+  peak_hours_note: string | null;
+  in_peak_hours: boolean;
 }
 
 // ── M4: Behavior Tracking ──

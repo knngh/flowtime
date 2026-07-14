@@ -162,21 +162,54 @@ pub async fn get_productivity_stats(
     })
 }
 
-/// Get the frontmost application name via macOS osascript.
+/// Get the frontmost application name. Implementation is platform-specific
+/// (P3-2): macOS uses osascript, Windows uses PowerShell, Linux uses xdotool.
 #[tauri::command]
 pub fn get_frontmost_app() -> Result<String, String> {
-    let output = std::process::Command::new("osascript")
-        .args([
-            "-e",
-            "tell application \"System Events\" to get name of first application process whose frontmost is true",
-        ])
-        .output()
-        .map_err(|e| format!("Failed to run osascript: {}", e))?;
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("osascript")
+            .args([
+                "-e",
+                "tell application \"System Events\" to get name of first application process whose frontmost is true",
+            ])
+            .output()
+            .map_err(|e| format!("Failed to run osascript: {}", e))?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        } else {
+            Err(format!("osascript error: {}", String::from_utf8_lossy(&output.stderr)))
+        }
+    }
 
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        let err = String::from_utf8_lossy(&output.stderr);
-        Err(format!("osascript error: {}", err))
+    #[cfg(target_os = "windows")]
+    {
+        let output = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "(Get-Process | Where-Object { $_.MainWindowTitle -ne '' } | Sort-Object StartTime -Descending | Select-Object -First 1).ProcessName",
+            ])
+            .output()
+            .map_err(|e| format!("Failed to run powershell: {}", e))?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        } else {
+            Err(format!("powershell error: {}", String::from_utf8_lossy(&output.stderr)))
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        match std::process::Command::new("xdotool")
+            .args(["getactivewindow", "getwindowname"])
+            .output()
+        {
+            Ok(o) if o.status.success() => {
+                Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
+            }
+            Ok(o) => Err(format!("xdotool error: {}", String::from_utf8_lossy(&o.stderr))),
+            Err(e) => Err(format!("Failed to run xdotool (is it installed?): {}", e)),
+        }
     }
 }

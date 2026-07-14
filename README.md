@@ -7,9 +7,12 @@
 [![React](https://img.shields.io/badge/React-19-61DAFB?logo=react)](https://react.dev/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.8-3178C6?logo=typescript)](https://www.typescriptlang.org/)
 [![Tailwind CSS](https://img.shields.io/badge/Tailwind-v4-06B6D4?logo=tailwindcss)](https://tailwindcss.com/)
+[![CI](https://github.com/knngh/flowtime/actions/workflows/ci.yml/badge.svg)](https://github.com/knngh/flowtime/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-MIT-green)](./LICENSE)
 
 Flowtime intelligently manages your tasks, tracks your focus sessions, monitors app usage patterns, and learns your productivity rhythms — all from a lightweight native desktop application.
+
+> **Current version: v3.0** — full second-round review applied. Frontend/backend type drift fixed, desktop notifications and global shortcuts are now wired end-to-end, productivity metrics are real (no more hardcoded zeros), and the app ships dark mode, cross-platform tracking, calendar scheduling, custom app categories, and CI.
 
 ---
 
@@ -18,16 +21,16 @@ Flowtime intelligently manages your tasks, tracks your focus sessions, monitors 
 ```
 ┌──────────────────────────────────────────────────────┐
 │                  React 19 Frontend                    │
-│  App.tsx · Components · Tailwind CSS v4               │
+│  App.tsx · Components · Tailwind CSS v4 (dark mode)   │
 ├──────────────────────────────────────────────────────┤
 │                  Tauri v2 Bridge                       │
-│  30+ invoke commands → 8 Rust backend modules         │
+│   30+ invoke commands → 9 Rust backend modules         │
 ├──────────┬──────────┬──────────┬─────────────────────┤
 │ focus.rs │ llm.rs   │ api.rs   │ tracking.rs         │
 │ auto_    │ integra- │ learning │ review.rs            │
-│ reply.rs │ tions.rs │ .rs      │                     │
+│ reply.rs │ tions.rs │ .rs      │ llm_common.rs        │
 ├──────────┴──────────┴──────────┴─────────────────────┤
-│              SQLite (5 migrations)                     │
+│              SQLite (6 migrations)                     │
 │  projects · tasks · focus_sessions · window_activity  │
 │  pending_replies · settings                           │
 ├──────────────────────────────────────────────────────┤
@@ -43,7 +46,7 @@ Flowtime intelligently manages your tasks, tracks your focus sessions, monitors 
 Full CRUD for projects and tasks with priority levels (**A/B/C**), estimated durations, tags, and manual drag-to-reorder. All data persisted in local SQLite.
 
 ### M2 — Natural Language Parsing & AI Scheduling
-Type tasks in plain language — Flowtime parses them into structured items using an OpenAI-compatible LLM (with heuristic fallback). AI also suggests optimal task ordering based on priority, deadlines, and dependencies.
+Type tasks in plain language — Flowtime parses them into structured items using an OpenAI-compatible LLM (with heuristic fallback). AI also suggests optimal task ordering **and writes real `scheduled_start` / `scheduled_end` time slots** into your calendar, back-to-back from the start of your peak productivity window (or 09:00).
 
 **💡 Works with Ollama**: Set `OLLAMA_API_BASE=http://localhost:11434/v1` to use local models (qwen2.5, llama3, etc.) — no cloud API key needed.
 
@@ -53,10 +56,18 @@ Output: ParsedTask { title: "Q3规划报告", priority: "A", duration: 120, dead
 ```
 
 ### M3 — Focus Mode
-Start a focus session linked to a task. **Pause / Resume** at any time — interruptions are tracked and counted. When you start a session, Flowtime auto-detects if you're in your peak productivity hours and suggests the best time to focus. Records start/end times, blocks interruptions, and tracks how many incoming messages were auto-replied.
+Start a focus session linked to a task. **Pause / Resume** at any time — interruptions are tracked and counted. When you start a session, Flowtime auto-detects if you're in your peak productivity hours and shows a subtle linkage note. Records start/end times and tracks how many incoming messages were auto-replied.
+
+- **Peak-hours linkage**: the start-focus result returns `peak_hours_note` + `in_peak_hours`; the frontend displays the note as a transient banner (P0-1).
+- **Pause/Resume UI** is fully wired to `pause_focus_session` / `resume_focus_session` (P0-2).
 
 ### M4 — Behavior Tracking
-Every 30 seconds, Flowtime logs your active window (app name + title) via `osascript` (macOS). Aggregates into daily time distribution and productivity statistics.
+Every 30 seconds, Flowtime logs your active window (app name + title). Implementation is **cross-platform** (P3-2):
+- **macOS** → `osascript`
+- **Windows** → PowerShell (`Get-Process`)
+- **Linux** → `xdotool`
+
+Aggregates into daily time distribution and productivity statistics.
 
 ### M5 — External Integrations
 Import tasks from three external sources with a single click:
@@ -72,28 +83,40 @@ Returns `ImportResult { tasks, errors }` — partial failures don't block succes
 ### M6 — AI Auto-Reply
 When in focus mode, incoming messages trigger an LLM-generated reply draft. Manage drafts through a full lifecycle: **pending → edit → send / discard**. Falls back to bilingual preset replies when LLM is unavailable.
 
+**Metrics are now real (P1-1):** every auto-reply while a focus session is active increments `messages_auto_replied`, so the weekly/daily report counters are no longer stuck at zero.
+
 ### 📱 Desktop Notifications
-Native OS notifications for deadline approaching and focus session completions.
+Native OS notifications actually fire (P0-4):
+- **Focus session end** — confirms duration (triggered from `end_focus_session`).
+- **Deadline reminder** — a background loop (`run_deadline_checker`, every 15 min) notifies you about tasks due within the next 2 hours (reads `scheduled_end` written by the AI scheduler).
+
+> Notifications require permission; Flowtime requests it once on startup.
 
 ### ⌨️ Global Keyboard Shortcuts
-`Cmd+Shift+F` — Quick toggle focus mode · `Cmd+Shift+O` — Show/hide Flowtime window
+Registered from the frontend via the `plugin-global-shortcut` JS API (version-stable, P0-3):
+- `Cmd/Ctrl+Shift+F` — start a focus session (ignored if one is already active)
+- `Cmd/Ctrl+Shift+O` — show & focus the Flowtime window
 
 ### 📦 Data Export & Import
-Full JSON backup and restore of all data (projects, tasks, focus sessions, settings, window activity). Use for migration, backup, or data portability.
+Full JSON backup and restore of all data (projects, tasks, focus sessions, settings, window activity). Use for migration, backup, or data portability. Round-trip serialization is covered by unit tests.
 
 ### 🧠 Local LLM Support
-Works with Ollama — set `OLLAMA_API_BASE=http://localhost:11434/v1` and `OLLAMA_MODEL=qwen2.5:7b`. No cloud API key required.
+Works with Ollama — set `OLLAMA_API_BASE=http://localhost:11434/v1` and `OLLAMA_MODEL=qwen2.5:7b`. No cloud API key required. The LLM config + request logic lives in a single shared module `llm_common.rs` (P2-1), removing the previous duplicated/dead-code paths (P2-4).
 
 ### M7 — Weekly & Daily Reports
 Dashboard views with:
 - Task completion rates (with week-over-week comparison)
-- High-risk task flags (approaching deadlines)
-- Time distribution pie chart (coding / meeting / communication / design / entertainment / browsing)
-- App categorization across **50+ apps** in 6 categories
+- **High-risk task flags** based on a **real `deferred_count`** (incremented by the `defer_task` command, P1-2) — no longer hardcoded to 0.
+- Time distribution by category (coding / meeting / communication / design / browsing / entertainment / other), using **user-defined category rules first, then a built-in heuristic** (P3-3).
+- **Real interruption counts** (`interruption_count` from focus sessions) instead of the always-zero `interruptions_blocked`.
 
 ### M8 — Behavior Learning
-- **Peak hours**: Sliding window analysis (2–4 hr) over focus session data to find your most productive time blocks
-- **Estimate calibration**: Weighted moving average of actual vs. estimated durations, stored per task
+- **Peak hours**: a single shared algorithm (`learning::compute_peak_ranges`, 2–4 hr window) is the source of truth for both the learning module and the focus module's peak-hours linkage (P1-3). Cached into `settings.peak_hours_data`.
+- **Estimate calibration**: weighted moving average of actual vs. estimated durations, stored per task.
+
+### 🌙 Dark Mode & Custom App Categories (P3-3)
+- Toggle **dark mode** from Settings (persisted in `localStorage`, applied via Tailwind v4 class strategy).
+- Define **custom app→category rules** in Settings; they are stored in `settings.app_category_rules` and take priority over the built-in heuristic in reports. Add/delete through the UI.
 
 ---
 
@@ -103,7 +126,7 @@ Dashboard views with:
 |-------|-----------|
 | Desktop Framework | Tauri v2 |
 | Frontend | React 19 + TypeScript 5.8 |
-| Styling | Tailwind CSS v4 |
+| Styling | Tailwind CSS v4 (class-based dark mode) |
 | Backend | Rust (edition 2021) |
 | Database | SQLite via `tauri-plugin-sql` + `sqlx` 0.8 |
 | HTTP Client | `reqwest` 0.12 (rustls-tls) |
@@ -120,7 +143,7 @@ Dashboard views with:
 
 - **Rust** 1.80+ ([rustup](https://rustup.rs/))
 - **Node.js** 18+ + npm
-- **macOS** 12+ (window tracking uses `osascript`)
+- **macOS** 12+ · **Windows 10+** · **Linux** (window tracking is cross-platform; Linux needs `xdotool`)
 
 ### Setup
 
@@ -169,26 +192,31 @@ export FEISHU_APP_SECRET="..."
 flowtime/
 ├── src/                          # React frontend
 │   ├── App.tsx                   # Main application component
-│   ├── App.css                   # Global styles
-│   ├── types.ts                  # TypeScript type definitions
-│   ├── integrations.ts           # External integration API layer
+│   ├── types.ts                  # TypeScript type definitions (kept in sync w/ backend)
+│   ├── focus.ts / review.ts / llm.ts / tracking.ts / auto_reply.ts / db.ts
 │   ├── components/
-│   │   └── IntegrationsPanel.tsx # External task import UI
+│   │   ├── FocusMode.tsx         # M3: focus overlay (pause/resume)
+│   │   ├── SettingsModal.tsx     # M9: dark mode + app categories
+│   │   ├── IntegrationsPanel.tsx # M5: external task import UI
+│   │   └── ...
 │   ├── main.tsx                  # React entry point
-│   └── vite-env.d.ts
+│   └── index.css                 # Tailwind v4 + dark-mode variant
 ├── src-tauri/                    # Rust backend
 │   ├── src/
-│   │   ├── lib.rs                # App entry, migrations, command registration
+│   │   ├── lib.rs                # App entry, migrations (v1–v6), command registration, deadline checker
 │   │   ├── api.rs                # Axum HTTP API server
 │   │   ├── auto_reply.rs         # M6: AI auto-reply drafts
-│   │   ├── focus.rs              # M3: Focus session management
+│   │   ├── focus.rs              # M3: Focus session management (+ peak-hours linkage)
 │   │   ├── integrations.rs       # M5: GitHub / Linear / Feishu
 │   │   ├── learning.rs           # M8: Peak hours & estimate calibration
-│   │   ├── llm.rs                # M2: NL parsing & AI scheduling
-│   │   ├── review.rs             # M7: Weekly/daily reports
-│   │   └── tracking.rs           # M4: Window activity logging
+│   │   ├── llm.rs                # M2: NL parsing & AI scheduling (writes real slots)
+│   │   ├── llm_common.rs         # Shared LLM config + chat + json extraction (P2-1)
+│   │   ├── review.rs             # M7: Weekly/daily reports + app categories + defer
+│   │   ├── tracking.rs           # M4: Window activity logging (cross-platform)
+│   │   └── data_io.rs            # JSON export/import
 │   ├── Cargo.toml
 │   └── tauri.conf.json           # Tauri config (window, bundle, CSP)
+├── .github/workflows/ci.yml      # Rust `cargo test` + frontend `npm run build`
 ├── package.json
 ├── vite.config.ts
 ├── tsconfig.json
@@ -200,11 +228,11 @@ flowtime/
 | Table | Purpose | Key Columns |
 |-------|---------|------------|
 | `projects` | Project containers | id, name, color |
-| `tasks` | Task items | id, title, priority, status, scheduled/actual times, project_id |
-| `focus_sessions` | Focus session records | id, task_id, start/end_time, interruptions_blocked |
+| `tasks` | Task items | id, title, priority, status, scheduled/actual times, project_id, **deferred_count, last_deferred_at** |
+| `focus_sessions` | Focus session records | id, task_id, start/end_time, **status, interruption_count**, interruptions_blocked, messages_auto_replied |
 | `window_activity` | App usage tracking | id, date, app_name, window_title, duration_seconds |
 | `pending_replies` | AI auto-reply queue | id, original_message, reply_draft, channel, status |
-| `settings` | Learned parameters | key, value (peak hours, calibration ratios) |
+| `settings` | Learned parameters | key, value (peak hours, calibration ratios, app category rules) |
 
 ---
 
@@ -232,23 +260,36 @@ npm run tauri build
 # Frontend only (browser)
 npm run dev
 npm run build
+
+# Run Rust unit tests
+cd src-tauri && cargo test
 ```
+
+---
+
+## Testing & CI
+
+- **Rust unit tests** cover the pure/parsing logic across `focus`, `review`, `learning`, `llm`, `data_io`, and `integrations` modules. Run with `cargo test`.
+- **GitHub Actions** (`.github/workflows/ci.yml`) runs `cargo test` and `npm run build` on every push/PR.
 
 ---
 
 ## Roadmap
 
 - [x] Focus session pause/resume with interruption tracking
-- [x] Desktop notifications for deadline reminders & focus end
-- [x] Global keyboard shortcuts (Cmd+Shift+F / Cmd+Shift+O)
-- [x] Unit tests for core modules (llm, learning, focus)
-- [x] Local LLM support via Ollama
+- [x] Desktop notifications for deadline reminders & focus end (actually firing)
+- [x] Global keyboard shortcuts (Cmd/Ctrl+Shift+F / Cmd/Ctrl+Shift+O)
+- [x] Real productivity metrics (interruptions, auto-replies, deferred count)
+- [x] Single peak-hours algorithm shared across modules
+- [x] Unit tests for core modules (focus, review, learning, llm, data_io, integrations)
+- [x] Local LLM support via Ollama (shared config module)
 - [x] Data export/import (JSON backup & restore)
-- [ ] Cross-platform window tracking (Windows / Linux)
-- [ ] User-defined app category rules
-- [ ] Dark mode support
+- [x] Cross-platform window tracking (Windows / Linux)
+- [x] User-defined app category rules
+- [x] Dark mode support
+- [x] Real calendar scheduling (writes scheduled_start/end)
+- [x] CI (cargo test + npm build)
 - [ ] Mobile companion via API server
-- [ ] Intelligent calendar-aware scheduling
 
 ---
 

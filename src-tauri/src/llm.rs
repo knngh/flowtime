@@ -1,4 +1,9 @@
+use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
+use tauri::State;
+
+use crate::llm_common::{chat_completion, extract_json};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ParsedTask {
@@ -15,157 +20,6 @@ struct TaskForSchedule {
     priority: String,
     estimated_duration_min: u32,
     status: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ChatMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ChatRequest {
-    model: String,
-    messages: Vec<ChatMessage>,
-    temperature: f32,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatChoice {
-    message: ChatMessage,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatResponse {
-    choices: Vec<ChatChoice>,
-}
-
-fn get_llm_config() -> (String, String, String) {
-    // Check for Ollama first (local LLM takes priority if configured)
-    let ollama_base = std::env::var("OLLAMA_API_BASE")
-        .or_else(|_| std::env::var("OLLAMA_HOST"))
-        .unwrap_or_default();
-
-    if !ollama_base.is_empty() {
-        let api_base = ollama_base.trim_end_matches('/').to_string();
-        let model = std::env::var("OLLAMA_MODEL")
-            .unwrap_or_else(|_| "qwen2.5:7b".to_string());
-        let api_key = "ollama".to_string();
-        return (api_base, api_key, model);
-    }
-
-    let api_base =
-        std::env::var("OPENAI_API_BASE").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-    let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-    let model =
-        std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
-    (api_base, api_key, model)
-}
-
-async fn chat_completion(system_prompt: &str, user_message: &str) -> Result<String, String> {
-    let (api_base, api_key, model) = get_llm_config();
-    let is_ollama = api_key == "ollama";
-
-    // Ollama works without OpenAI API key; OpenAI requires key
-    if api_key.is_empty() || (api_key != "ollama" && api_key.is_empty()) {
-        return Err("NO_API_KEY".to_string());
-    }
-
-    if !is_ollama && api_key.is_empty() {
-        return Err("NO_API_KEY".to_string());
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("CLIENT_ERROR: {}", e))?;
-
-    let request = ChatRequest {
-        model,
-        messages: vec![
-            ChatMessage {
-                role: "system".to_string(),
-                content: system_prompt.to_string(),
-            },
-            ChatMessage {
-                role: "user".to_string(),
-                content: user_message.to_string(),
-            },
-        ],
-        temperature: 0.1,
-    };
-
-    let response = client
-        .post(format!(
-            "{}/chat/completions",
-            api_base.trim_end_matches('/')
-        ))
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&request)
-        .send()
-        .await
-        .map_err(|e| format!("NETWORK_ERROR: {}", e))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!(
-            "API_ERROR: HTTP {} — {}",
-            status,
-            &body[..200.min(body.len())]
-        ));
-    }
-
-    let chat_response: ChatResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("PARSE_ERROR: {}", e))?;
-
-    chat_response
-        .choices
-        .into_iter()
-        .next()
-        .map(|c| c.message.content)
-        .ok_or_else(|| "EMPTY_RESPONSE".to_string())
-}
-
-fn extract_json(content: &str) -> &str {
-    let content = content.trim();
-
-    // Try to find JSON in ```json ... ```
-    if let Some(start) = content.find("```json") {
-        let after = &content[start + 7..];
-        if let Some(end) = after.find("```") {
-            return after[..end].trim();
-        }
-    }
-    // Try to find JSON in ``` ... ```
-    if let Some(start) = content.find("```") {
-        let after = &content[start + 3..];
-        if let Some(end) = after.find("```") {
-            return after[..end].trim();
-        }
-    }
-
-    // Find outermost JSON object/array by brace/bracket matching
-    if let Some(start) = content.find(|c| c == '{' || c == '[') {
-        let rest = &content[start..];
-        let open: char = rest.chars().next().unwrap();
-        let close: char = if open == '{' { '}' } else { ']' };
-        let mut depth = 0;
-        for (i, ch) in rest.char_indices() {
-            if ch == open {
-                depth += 1;
-            } else if ch == close {
-                depth -= 1;
-                if depth == 0 {
-                    return &rest[..=i];
-                }
-            }
-        }
-    }
-    content
 }
 
 // ── Tauri Commands ──
@@ -317,7 +171,8 @@ fn fallback_parse(input: &str) -> Result<ParsedTask, String> {
 }
 
 #[tauri::command]
-pub async fn suggest_schedule(tasks_json: String) -> Result<Vec<String>, String> {
+pub async fn suggest_schedule(tasks_json: String, state: State<'_, SqlitePool>) -> Result<Vec<String>, String> {
+    let pool = state.inner();
     let tasks: Vec<TaskForSchedule> = serde_json::from_str(&tasks_json)
         .map_err(|e| format!("INVALID_TASKS_JSON: {}", e))?;
 
@@ -339,14 +194,12 @@ Example: ["id-abc", "id-xyz", "id-123"]"#;
 
     let user_message = serde_json::to_string_pretty(&tasks).unwrap_or_default();
 
-    match chat_completion(system_prompt, &user_message).await {
+    let ordered = match chat_completion(system_prompt, &user_message).await {
         Ok(content) => {
             let json_str = extract_json(&content);
-            // Try direct array parse
             match serde_json::from_str::<Vec<String>>(json_str) {
-                Ok(ids) => Ok(ids),
+                Ok(ids) => ids,
                 Err(_) => {
-                    // Try wrapped in object
                     #[derive(Deserialize)]
                     struct Wrapper {
                         order: Vec<String>,
@@ -356,24 +209,77 @@ Example: ["id-abc", "id-xyz", "id-123"]"#;
                         suggested_order: Option<Vec<String>>,
                     }
                     match serde_json::from_str::<Wrapper>(json_str) {
-                        Ok(w) => {
-                            let ids = w
-                                .suggested_order
-                                .or(w.task_ids)
-                                .unwrap_or(w.order);
-                            Ok(ids)
+                        Ok(w) => w.suggested_order.or(w.task_ids).unwrap_or(w.order),
+                        Err(e) => {
+                            log::warn!("Schedule JSON parse failed: {}, falling back", e);
+                            fallback_schedule(&tasks)
                         }
-                        Err(e) => Err(format!(
-                            "JSON_PARSE_ERROR: {} — raw: {}",
-                            e,
-                            &content[..200.min(content.len())]
-                        )),
                     }
                 }
             }
         }
-        Err(_) => Ok(fallback_schedule(&tasks)),
+        Err(_) => fallback_schedule(&tasks),
+    };
+
+    // P3-1: write real time slots into the calendar, filling from the user's
+    // next peak hour (or 09:00 today as default).
+    if let Err(e) = write_schedule_slots(&pool, &tasks, &ordered).await {
+        log::warn!("Failed to write schedule slots: {}", e);
     }
+
+    Ok(ordered)
+}
+
+/// Fill `scheduled_start`/`scheduled_end` for the ordered tasks, back-to-back
+/// from the start of the user's peak window (or 09:00). Tasks keep their own
+/// duration; the cursor advances by each task's estimated minutes.
+async fn write_schedule_slots(
+    pool: &SqlitePool,
+    tasks: &[TaskForSchedule],
+    ordered: &[String],
+) -> Result<(), String> {
+    let now = Utc::now();
+
+    // Determine a start hour: next peak hour today, else 09:00.
+    let start_hour: u32 = crate::learning::compute_peak_ranges(pool, 14)
+        .await
+        .first()
+        .map(|p| p.start_hour.max(0) as u32)
+        .unwrap_or(9);
+
+    let mut cursor = now
+        .date_naive()
+        .and_hms_opt(start_hour, 0, 0)
+        .unwrap_or_else(|| now.date_naive().and_hms_opt(9, 0, 0).unwrap())
+        .and_local_timezone(chrono::Utc)
+        .unwrap();
+
+    // Don't schedule in the past: if the cursor is before now, push to now.
+    if cursor < now {
+        cursor = now;
+    }
+
+    let by_id: std::collections::HashMap<&str, &TaskForSchedule> =
+        tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+
+    for id in ordered {
+        if let Some(task) = by_id.get(id.as_str()) {
+            let start = cursor;
+            let dur = Duration::minutes(task.estimated_duration_min as i64);
+            let end = start + dur;
+            sqlx::query(
+                "UPDATE tasks SET scheduled_start = ?, scheduled_end = ? WHERE id = ?",
+            )
+            .bind(start.to_rfc3339())
+            .bind(end.to_rfc3339())
+            .bind(id)
+            .execute(pool)
+            .await
+            .map_err(|e| format!("schedule write error: {}", e))?;
+            cursor = end;
+        }
+    }
+    Ok(())
 }
 
 fn fallback_schedule(tasks: &[TaskForSchedule]) -> Vec<String> {
@@ -420,6 +326,7 @@ fn priority_value(p: &str) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm_common::extract_json;
 
     #[test]
     fn test_extract_json_code_fence() {
